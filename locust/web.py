@@ -131,6 +131,26 @@ def distribution_stats_csv():
     response.headers["Content-disposition"] = disposition
     return response
 
+@app.route('/stats/detail')
+def request_detail():
+    stats = []
+    for s in chain(_sort_stats(runners.locust_runner.request_stats), [runners.locust_runner.stats.aggregated_stats("Total")]):
+        stats.append({
+            "method": s.method,
+            "name": s.name,
+            "num_requests": s.num_requests,
+            "num_reqs_per_sec": s.num_reqs_per_sec,
+            "response_times_his" :  dict([(i,sum(v)/len(v)) for i,v in s.response_times_his.items()]),
+            "num_failures": s.num_failures,
+            "avg_response_time": s.avg_response_time,
+            "min_response_time": s.min_response_time,
+            "max_response_time": s.max_response_time,
+            "current_rps": s.current_rps,
+            "median_response_time": s.median_response_time,
+            "avg_content_length": s.avg_content_length,
+        })
+    return json.dumps(stats)
+        
 @app.route('/stats/requests')
 def request_stats():
     global _request_stats_context_cache
@@ -140,8 +160,10 @@ def request_stats():
         now = time()
         
         stats = []
+
         for s in chain(_sort_stats(runners.locust_runner.request_stats), [runners.locust_runner.stats.aggregated_stats("Total")]):
             stats.append({
+                #"raw" : s.serialize(),
                 "method": s.method,
                 "name": s.name,
                 "num_requests": s.num_requests,

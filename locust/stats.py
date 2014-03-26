@@ -32,7 +32,7 @@ class RequestStats(object):
             self.entries[(name, method)] = entry
         return entry
     
-    def aggregated_stats(self, name="Total", full_request_history=False):
+    def aggregated_stats(self, name="Total", full_request_history=True):
         """
         Returns a StatsEntry which is an aggregate of all stats entries 
         within entries.
@@ -93,7 +93,8 @@ class StatsEntry(object):
     
     num_reqs_per_sec = None
     """ A {second => request_count} dict that holds the number of requests made per second """
-    
+    # added by om 
+    response_times_his = None
     response_times = None
     """
     A {response_time => count} dict that holds the the response time distribution of all 
@@ -130,6 +131,7 @@ class StatsEntry(object):
         self.max_response_time = 0
         self.last_request_timestamp = int(time.time())
         self.num_reqs_per_sec = {}
+        self.response_times_his = {}
         self.total_content_length = 0
     
     def log(self, response_time, content_length):
@@ -138,7 +140,7 @@ class StatsEntry(object):
 
         self._log_time_of_request()
         self._log_response_time(response_time)
-
+        self._log_response_time_his(response_time)
         # increase total content-length
         self.total_content_length += content_length
 
@@ -148,6 +150,10 @@ class StatsEntry(object):
         self.last_request_timestamp = t
         self.stats.last_request_timestamp = t
 
+    def _log_response_time_his(self, response_time):
+        t = int(time.time()) 
+        self.response_times_his.setdefault(t, []).append(response_time)
+        
     def _log_response_time(self, response_time):
         self.total_response_time += response_time
 
@@ -231,7 +237,7 @@ class StatsEntry(object):
         except ZeroDivisionError:
             return 0
     
-    def extend(self, other, full_request_history=False):
+    def extend(self, other, full_request_history=True):
         """
         Extend the data fro the current StatsEntry with the stats from another
         StatsEntry instance. 
@@ -277,6 +283,7 @@ class StatsEntry(object):
             "total_content_length": self.total_content_length,
             "response_times": self.response_times,
             "num_reqs_per_sec": self.num_reqs_per_sec,
+            "response_times_his" : self.response_times_his
         }
     
     @classmethod
