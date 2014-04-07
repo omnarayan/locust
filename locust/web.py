@@ -3,6 +3,7 @@
 import json
 import os.path
 from time import time
+from time import sleep
 from itertools import chain
 from collections import defaultdict
 
@@ -13,9 +14,17 @@ import runners
 from runners import MasterLocustRunner
 from locust.stats import median_from_dict
 from locust import version
-import gevent
 
+import requests
 import logging
+
+import gevent.monkey
+from gevent.pywsgi import WSGIServer
+gevent.monkey.patch_all()
+
+from flask import Flask, request, Response, render_template
+
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_TIME = 2.0
@@ -26,6 +35,11 @@ app.root_path = os.path.dirname(os.path.abspath(__file__))
 
 _request_stats_context_cache = {}
 
+projectId = ''
+sendData = False
+robustestUrl = 'http://localhost:8080/performance'
+robustestUrl = 'http://dev.robustest.com/performance'
+isStreaming = False
 @app.route('/')
 def index():
     is_distributed = isinstance(runners.locust_runner, MasterLocustRunner)
@@ -45,9 +59,15 @@ def index():
 @app.route('/swarm', methods=["POST"])
 def swarm():
     assert request.method == "POST"
-
-    locust_count = int(request.form["locust_count"])
-    hatch_rate = float(request.form["hatch_rate"])
+    global projectId
+    global sendData
+    global isStreaming
+    sendData = True
+    if isStreaming:
+        isStreaming = False
+    projectId = request.json["projectId"]
+    locust_count = int(request.json["userCount"])
+    hatch_rate = float(request.json["rate"])
     runners.locust_runner.start_hatching(locust_count, hatch_rate)
     response = make_response(json.dumps({'success':True, 'message': 'Swarming started'}))
     response.headers["Content-type"] = "application/json"
@@ -55,6 +75,10 @@ def swarm():
 
 @app.route('/stop')
 def stop():
+    global sendData
+    global isStreaming
+    sendData = False
+    isStreaming = True
     runners.locust_runner.stop()
     response = make_response(json.dumps({'success':True, 'message': 'Test stopped'}))
     response.headers["Content-type"] = "application/json"
@@ -134,6 +158,7 @@ def distribution_stats_csv():
 @app.route('/stats/detail')
 def request_detail():
     stats = []
+    global projectId
     for s in chain(_sort_stats(runners.locust_runner.request_stats), [runners.locust_runner.stats.aggregated_stats("Total")]):
         stats.append({
             "method": s.method,
@@ -149,12 +174,13 @@ def request_detail():
             "median_response_time": s.median_response_time,
             "avg_content_length": s.avg_content_length,
         })
-    return json.dumps(stats)
+
+    return json.dumps({'stats' : stats, 'projectId' :projectId})
         
 @app.route('/stats/requests')
 def request_stats():
     global _request_stats_context_cache
-    
+    global projectId    
     if not _request_stats_context_cache or _request_stats_context_cache["last_time"] < time() - _request_stats_context_cache.get("cache_time", DEFAULT_CACHE_TIME):
         cache_time = _request_stats_context_cache.get("cache_time", DEFAULT_CACHE_TIME)
         now = time()
@@ -205,6 +231,80 @@ def request_stats():
     else:
         report = _request_stats_context_cache["report"]
     return json.dumps(report)
+
+def event_stream():
+    count = 0
+    global sendData
+    global projectId
+    global _request_stats_context_cache
+    while sendData:
+        if not _request_stats_context_cache or _request_stats_context_cache["last_time"] < time() - _request_stats_context_cache.get("cache_time", DEFAULT_CACHE_TIME):
+            cache_time = _request_stats_context_cache.get("cache_time", DEFAULT_CACHE_TIME)
+            now = time()
+            
+            stats = []
+
+            for s in chain(_sort_stats(runners.locust_runner.request_stats), [runners.locust_runner.stats.aggregated_stats("Total")]):
+                stats.append({
+                    #"raw" : s.serialize(),
+                    "method": s.method,
+                    "name": s.name,
+                    "num_requests": s.num_requests,
+                    "num_failures": s.num_failures,
+                    "avg_response_time": s.avg_response_time,
+                    "min_response_time": s.min_response_time,
+                    "max_response_time": s.max_response_time,
+                    "current_rps": s.current_rps,
+                    "median_response_time": s.median_response_time,
+                    "avg_content_length": s.avg_content_length,
+                })
+            
+            report = {"stats":stats, "errors":[e.to_dict() for e in runners.locust_runner.errors.itervalues()]}
+            if stats:
+                report["total_rps"] = stats[len(stats)-1]["current_rps"]
+                report["fail_ratio"] = runners.locust_runner.stats.aggregated_stats("Total").fail_ratio
+                
+                # since generating a total response times dict with all response times from all
+                # urls is slow, we make a new total response time dict which will consist of one
+                # entry per url with the median response time as key and the number of requests as
+                # value
+                response_times = defaultdict(int) # used for calculating total median
+                for i in xrange(len(stats)-1):
+                    response_times[stats[i]["median_response_time"]] += stats[i]["num_requests"]
+                
+                # calculate total median
+                stats[len(stats)-1]["median_response_time"] = median_from_dict(stats[len(stats)-1]["num_requests"], response_times)
+            
+            is_distributed = isinstance(runners.locust_runner, MasterLocustRunner)
+            if is_distributed:
+                report["slave_count"] = runners.locust_runner.slave_count
+            
+            report["state"] = runners.locust_runner.state
+            report["user_count"] = runners.locust_runner.user_count
+
+            elapsed = time() - now
+            cache_time = max(cache_time, elapsed * 2.0) # Increase cache_time when report generating starts to take longer time
+            _request_stats_context_cache = {"last_time": elapsed - now, "report": report, "cache_time": cache_time}
+        else:
+            report = _request_stats_context_cache["report"]
+        gevent.sleep(1)
+        yield json.dumps({'projectId' : projectId, 'report' :report})
+
+@app.route('/stats/put')
+def request_stats_puts():
+    
+    global projectId    
+    global sendData
+    global isStreaming
+    global robustestUrl
+    if not isStreaming and sendData:
+        isStreaming = True
+        for payload in event_stream():
+            requests.put(robustestUrl, data=payload)
+    else :
+        print 'values', isStreaming, sendData
+        return 'false'
+    return 'ok'
 
 @app.route("/exceptions")
 def exceptions():
